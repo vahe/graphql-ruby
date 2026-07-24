@@ -109,6 +109,56 @@ GRAPHQL
             tokens = subject.tokenize(query_str)
             assert_equal ['text', ':', 'b\\\\', 'otherText', ':', 'a',], tokens.map(&:value)
           end
+
+          it "trims whitespace like the reference implementation" do
+            # These pin BlockString.trim_whitespace's behavior. The C lexer has its own
+            # port of it, so these shared examples keep the two implementations in step.
+            expectations = {
+              # single line, no newline: returned as-is, even with surrounding spaces
+              "a   " => "a   ",
+              "  a" => "  a",
+              # ...including when it is only whitespace, as long as it doesn't start with a space
+              "\t" => "\t",
+              "\r \v" => "\r \v",
+              " \t" => "",
+              # leading/trailing blank lines are removed
+              "\n\n  hello\n" => "hello",
+              "a\n\n\n" => "a",
+              "\n    a\n      b\n" => "a\n  b",
+              # all-blank strings become empty
+              " \n \n " => "",
+              # the first line never contributes to (or receives) indent stripping
+              "  first\n  second" => "  first\nsecond",
+              # interior blank lines are preserved (even when shorter than the common indent)
+              "  a\n\n  b" => "  a\n\nb",
+              "a\n    b\n  \n    c" => "a\nb\n\nc",
+              # only spaces count as indent: a tab or \r at column 0 makes the common indent 0
+              "a\n\tb\n  c" => "a\n\tb\n  c",
+              "a\n\r\n  b" => "a\n\r\n  b",
+              # \r survives at line ends (CRLF input)
+              "a\r\n  b\r\n  c" => "a\r\nb\r\nc",
+              # common indent is the minimum across lines after the first
+              "a\n      deep\n  shallow" => "a\n    deep\nshallow",
+              # indent stripping is byte-safe with multibyte content
+              "  🂡\n    🂢\n  🂣" => "  🂡\n  🂢\n🂣",
+            }
+            expectations.each do |input, expected|
+              tokens = subject.tokenize("{ f(a: \"\"\"#{input}\"\"\") }")
+              str_token = tokens.find { |t| t.name == :STRING }
+              assert_equal expected, str_token.value, "trims #{input.inspect} correctly"
+            end
+          end
+
+          it "counts raw (pre-trim) newlines for the positions of following tokens" do
+            doc = "{ f(a: \"\"\"\n\n  x\n\n\"\"\") g }"
+            tokens = subject.tokenize(doc)
+            str_token = tokens.find { |t| t.name == :STRING }
+            assert_equal "x", str_token.value
+            g_token = tokens.find { |t| t.value == "g" }
+            # 4 raw newlines inside the block string put `g` on line 5,
+            # no matter what trimming removed
+            assert_equal 5, g_token.line
+          end
         end
 
         it "unescapes escaped characters" do

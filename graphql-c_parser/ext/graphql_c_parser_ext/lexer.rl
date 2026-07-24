@@ -218,6 +218,113 @@ typedef struct Meta {
   token_content = rb_utf8_str_new(ts, te - ts); \
   break;
 
+
+#define GQL_BLOCK_STRING_STACK_LINES 64
+
+// Matches Ruby's /\s/: space, \t, \n, \v, \f, \r
+static int gql_has_non_whitespace(const char *p, long len) {
+  long i;
+  for (i = 0; i < len; i++) {
+    unsigned char b = (unsigned char)p[i];
+    if (b != ' ' && (b < '\t' || b > '\r')) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+// C port of GraphQL::Language::BlockString.trim_whitespace. It reads the raw
+// bytes between the triple quotes once, recording line starts, and then
+// copies the kept lines into an exactly-sized string. It also returns the raw
+// newline count, which the lexer needs for the line numbers of later tokens.
+static VALUE gql_trim_block_string(const char *str, long len, int *newlines) {
+  long stack_starts[GQL_BLOCK_STRING_STACK_LINES];
+  long *starts = stack_starts;
+  long capacity = GQL_BLOCK_STRING_STACK_LINES;
+  volatile VALUE heap_starts = 0;
+  const char *endp = str + len;
+  const char *p = str;
+  long count = 0;
+  long common_indent = -1;
+  long first_kept = -1;
+  long last_kept = -1;
+  long i;
+
+  while (1) {
+    const char *nl = p < endp ? memchr(p, '\n', endp - p) : NULL;
+    long line_len = (nl ? nl : endp) - p;
+    long indent = 0;
+
+    if (count == capacity) {
+      volatile VALUE grown_store = 0;
+      long *grown = rb_alloc_tmp_buffer2(&grown_store, capacity * 2, sizeof(long));
+      memcpy(grown, starts, capacity * sizeof(long));
+      if (heap_starts) rb_free_tmp_buffer(&heap_starts);
+      heap_starts = grown_store;
+      starts = grown;
+      capacity *= 2;
+    }
+    starts[count] = p - str;
+
+    while (indent < line_len && p[indent] == ' ') indent++;
+    if (indent < line_len) {
+      // Like Ruby, the first line never sets the common indent, and lines
+      // with only spaces don't either (but "  \t" does).
+      if (count > 0 && (common_indent < 0 || indent < common_indent)) {
+        common_indent = indent;
+      }
+      if (gql_has_non_whitespace(p + indent, line_len - indent)) {
+        if (first_kept < 0) first_kept = count;
+        last_kept = count;
+      }
+    }
+    count++;
+    if (!nl) break;
+    p = nl + 1;
+  }
+  *newlines = (int)(count - 1);
+
+  // Ruby's early return: a single line without a leading space is kept as-is,
+  // even when it is only whitespace (e.g. "\t").
+  if (count == 1 && (len == 0 || str[0] != ' ')) {
+    if (heap_starts) rb_free_tmp_buffer(&heap_starts);
+    return rb_utf8_str_new(str, len);
+  }
+  if (first_kept < 0) {
+    if (heap_starts) rb_free_tmp_buffer(&heap_starts);
+    return rb_utf8_str_new("", 0);
+  }
+
+  #define GQL_LINE_LEN(idx) (((idx) + 1 < count ? starts[(idx) + 1] - 1 : len) - starts[idx])
+  VALUE result;
+  if (common_indent <= 0 || last_kept == 0) {
+    // Nothing to strip: the kept lines are one contiguous span of the source.
+    long span_start = starts[first_kept];
+    long span_end = starts[last_kept] + GQL_LINE_LEN(last_kept);
+    result = rb_utf8_str_new(str + span_start, span_end - span_start);
+  } else {
+    // Lines shorter than the common indent are only spaces; strip all of them.
+    long out_len = last_kept - first_kept; // joining newlines
+    for (i = first_kept; i <= last_kept; i++) {
+      long line_len = GQL_LINE_LEN(i);
+      long strip = i == 0 ? 0 : (common_indent < line_len ? common_indent : line_len);
+      out_len += line_len - strip;
+    }
+    result = rb_utf8_str_new(NULL, out_len);
+    char *dst = RSTRING_PTR(result);
+    for (i = first_kept; i <= last_kept; i++) {
+      long line_len = GQL_LINE_LEN(i);
+      long strip = i == 0 ? 0 : (common_indent < line_len ? common_indent : line_len);
+      if (i > first_kept) *dst++ = '\n';
+      memcpy(dst, str + starts[i] + strip, line_len - strip);
+      dst += line_len - strip;
+    }
+  }
+  #undef GQL_LINE_LEN
+  if (heap_starts) rb_free_tmp_buffer(&heap_starts);
+  return result;
+}
+
 void emit(TokenType tt, char *ts, char *te, Meta *meta) {
   meta->tokens_count++;
   // -1 indicates that there is no limit:
@@ -337,8 +444,7 @@ void emit(TokenType tt, char *ts, char *te, Meta *meta) {
     case BLOCK_STRING:
       token_sym = ID2SYM(rb_intern("STRING"));
       quotes_length = 3;
-      token_content = rb_utf8_str_new(ts + quotes_length, (te - ts - (2 * quotes_length)));
-      line_incr = FIX2INT(rb_funcall(token_content, rb_intern("count"), 1, rb_utf8_str_new_cstr("\n")));
+      token_content = gql_trim_block_string(ts + quotes_length, (te - ts - (2 * quotes_length)), &line_incr);
       break;
     // These are used only by the parser, this is never reached
     case STRING:
@@ -347,30 +453,27 @@ void emit(TokenType tt, char *ts, char *te, Meta *meta) {
   }
 
   if (token_sym != Qnil) {
-    if (tt == BLOCK_STRING || tt == QUOTED_STRING) {
+    if (tt == BLOCK_STRING) {
+      // content was already trimmed in C (gql_trim_block_string)
+      tt = STRING;
+    } else if (tt == QUOTED_STRING) {
       VALUE mGraphQL = rb_const_get_at(rb_cObject, rb_intern("GraphQL"));
       VALUE mGraphQLLanguage = rb_const_get_at(mGraphQL, rb_intern("Language"));
       VALUE mGraphQLLanguageLexer = rb_const_get_at(mGraphQLLanguage, rb_intern("Lexer"));
       VALUE valid_string_pattern = rb_const_get_at(mGraphQLLanguageLexer, rb_intern("VALID_STRING"));
-      if (tt == BLOCK_STRING) {
-        VALUE mGraphQLLanguageBlockString = rb_const_get_at(mGraphQLLanguage, rb_intern("BlockString"));
-        token_content = rb_funcall(mGraphQLLanguageBlockString, rb_intern("trim_whitespace"), 1, token_content);
-        tt = STRING;
-      } else {
-        tt = STRING;
-        if (
-          RB_TEST(rb_funcall(token_content, rb_intern("valid_encoding?"), 0)) &&
-            RB_TEST(rb_funcall(token_content, rb_intern("match?"), 1, valid_string_pattern))
-        ) {
-          rb_funcall(mGraphQLLanguageLexer, rb_intern("replace_escaped_characters_in_place"), 1, token_content);
-          if (!RB_TEST(rb_funcall(token_content, rb_intern("valid_encoding?"), 0))) {
-            token_sym = ID2SYM(rb_intern("BAD_UNICODE_ESCAPE"));
-            tt = BAD_UNICODE_ESCAPE;
-          }
-        } else {
+      tt = STRING;
+      if (
+        RB_TEST(rb_funcall(token_content, rb_intern("valid_encoding?"), 0)) &&
+          RB_TEST(rb_funcall(token_content, rb_intern("match?"), 1, valid_string_pattern))
+      ) {
+        rb_funcall(mGraphQLLanguageLexer, rb_intern("replace_escaped_characters_in_place"), 1, token_content);
+        if (!RB_TEST(rb_funcall(token_content, rb_intern("valid_encoding?"), 0))) {
           token_sym = ID2SYM(rb_intern("BAD_UNICODE_ESCAPE"));
           tt = BAD_UNICODE_ESCAPE;
         }
+      } else {
+        token_sym = ID2SYM(rb_intern("BAD_UNICODE_ESCAPE"));
+        tt = BAD_UNICODE_ESCAPE;
       }
     }
 
