@@ -44,6 +44,40 @@ if defined?(GraphQL::CParser::Lexer)
       assert_equal GraphQL.scan_with_ruby("1e400"), tokens
     end
 
+    it "trims and tokenizes block strings exactly like the Ruby lexer" do
+      block_string_bodies = [
+        "a   ",
+        "  a",
+        "\t",
+        "\r \v",
+        " \t",
+        (["  line"] * 100).join("\n"),
+        "\n\n  hello\n",
+        "a\n\n\n",
+        "\n    a\n      b\n",
+        " \n \n ",
+        "  first\n  second",
+        "  a\n\n  b",
+        "a\n    b\n  \n    c",
+        "a\n\tb\n  c",
+        "a\n\r\n  b",
+        "a\r\n  b\r\n  c",
+        "a\n      deep\n  shallow",
+        "  \u{1F0A1}\n    \u{1F0A2}\n  \u{1F0A3}",
+        "c\n \\\"\"\" d",
+        "{\"foo\":\"bar\"}",
+      ]
+      block_string_bodies.each do |body|
+        doc = "{ f(a: \"\"\"#{body}\"\"\") g }"
+        # Columns are excluded from this comparison: the C lexer counts them in bytes
+        # and doesn't reset them at newlines inside a token, so they drift after
+        # multibyte or multi-line tokens. That's a separate, pre-existing bug.
+        c_tokens = GraphQL.scan_with_c(doc).map { |t| [t[0], t[1], t[3], t[3].encoding] }
+        ruby_tokens = GraphQL.scan_with_ruby(doc).map { |t| [t[0], t[1], t[3], t[3].encoding] }
+        assert_equal(ruby_tokens, c_tokens, "lexes block string #{body.inspect} identically")
+      end
+    end
+
     it "makes frozen strings when using SchemaParser" do
       str = "type Query { f1: Int }"
       schema_ast = GraphQL::CParser::SchemaParser.new(str, nil, GraphQL::Tracing::NullTrace, nil).result
